@@ -1,84 +1,107 @@
+// server.go
 package main
 
 import (
+	"bytes"
 	"encoding/json"
+	"fmt"
 	"log"
-	"math/rand"
 	"net/http"
 	"sync"
 )
 
-type Vote struct {
-	VoterID string `json:"voter_id"`
-	Choice  string `json:"choice"`
-}
-
 type Server struct {
 	ID         int
-	VoteStore  map[string]string
-	mutex      sync.Mutex
-	isFaulty   bool
-	httpServer *http.Server
+	Port       string
+	Peers      []string
+	Votes      map[string]string
+	VotesMutex sync.Mutex
+	Faulty     bool // Simulate faulty behavior
 }
 
-func NewServer(id int, isFaulty bool) *Server {
+func NewServer(id int, port string, peers []string, faulty bool) *Server {
 	return &Server{
-		ID:        id,
-		VoteStore: make(map[string]string),
-		isFaulty:  isFaulty,
+		ID:     id,
+		Port:   port,
+		Peers:  peers,
+		Votes:  make(map[string]string),
+		Faulty: faulty,
 	}
 }
 
-func (s *Server) CastVote(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleVote(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Only POST method is allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
 	var vote Vote
-	if err := json.NewDecoder(r.Body).Decode(&vote); err != nil {
-		http.Error(w, "Invalid request", http.StatusBadRequest)
+	err := json.NewDecoder(r.Body).Decode(&vote)
+	if err != nil {
+		http.Error(w, "Invalid vote data", http.StatusBadRequest)
 		return
 	}
 
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
+	s.VotesMutex.Lock()
+	s.Votes[vote.VoterID] = vote.Choice
+	s.VotesMutex.Unlock()
 
-	if s.isFaulty {
-		// Malicious behavior: Flip vote choice randomly
-		log.Printf("Server %d (Faulty): Received vote from %s, altering vote choice!", s.ID, vote.VoterID)
-		vote.Choice = []string{"A", "B", "C"}[rand.Intn(3)]
-	} else {
-		log.Printf("Server %d: Received vote from %s for choice %s", s.ID, vote.VoterID, vote.Choice)
-	}
-	s.VoteStore[vote.VoterID] = vote.Choice
+	go s.broadcastVote(vote)
+
 	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, "Vote received by server %d", s.ID)
 }
 
-func (s *Server) GetVotes(w http.ResponseWriter, r *http.Request) {
-	s.mutex.Lock()
-	defer s.mutex.Unlock()
-
-	if s.isFaulty {
-		// Malicious behavior: Provide incorrect votes
-		log.Printf("Server %d (Faulty): Returning altered vote results!", s.ID)
-		faultyVotes := map[string]string{}
-		for voter := range s.VoteStore {
-			faultyVotes[voter] = []string{"A", "B", "C"}[rand.Intn(3)]
+func (s *Server) broadcastVote(vote Vote) {
+	for _, peer := range s.Peers {
+		url := fmt.Sprintf("http://%s/consensus", peer)
+		data, _ := json.Marshal(vote)
+		_, err := http.Post(url, "application/json", bytes.NewBuffer(data))
+		if err != nil {
+			log.Printf("Server %d failed to send vote to %s: %v", s.ID, peer, err)
 		}
-		json.NewEncoder(w).Encode(faultyVotes)
+	}
+}
+
+func (s *Server) handleConsensus(w http.ResponseWriter, r *http.Request) {
+	if s.Faulty {
+		// Simulate faulty behavior
+		http.Error(w, "Server is faulty", http.StatusInternalServerError)
 		return
 	}
 
-	log.Printf("Server %d: Returning correct vote results", s.ID)
-	json.NewEncoder(w).Encode(s.VoteStore)
-}
-
-func (s *Server) StartServer(port string) {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/cast", s.CastVote)
-	mux.HandleFunc("/votes", s.GetVotes)
-
-	s.httpServer = &http.Server{
-		Addr:    ":" + port,
-		Handler: mux,
+	var vote Vote
+	err := json.NewDecoder(r.Body).Decode(&vote)
+	if err != nil {
+		http.Error(w, "Invalid data", http.StatusBadRequest)
+		return
 	}
 
-	log.Printf("Server %d starting on port %s (Faulty: %v)", s.ID, port, s.isFaulty)
-	log.Fatal(s.httpServer.ListenAndServe())
+	s.VotesMutex.Lock()
+	s.Votes[vote.VoterID] = vote.Choice
+	s.VotesMutex.Unlock()
+
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, "Consensus updated on server %d", s.ID)
+}
+
+func (s *Server) handleResults(w http.ResponseWriter, r *http.Request) {
+	s.VotesMutex.Lock()
+	defer s.VotesMutex.Unlock()
+
+	results := make(map[string]int)
+	for _, choice := range s.Votes {
+		results[choice]++
+	}
+
+	json.NewEncoder(w).Encode(results)
+}
+
+func (s *Server) Start() {
+	http.HandleFunc("/vote", s.handleVote)
+	http.HandleFunc("/consensus", s.handleConsensus)
+	http.HandleFunc("/results", s.handleResults)
+
+	log.Printf("Server %d starting on port %s", s.ID, s.Port)
+	log.Fatal(http.ListenAndServe(":"+s.Port, nil))
 }
