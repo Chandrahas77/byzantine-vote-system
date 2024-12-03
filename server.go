@@ -46,7 +46,13 @@ func (s *Server) handleVote(w http.ResponseWriter, r *http.Request) {
 	s.Votes[vote.VoterID] = vote.Choice
 	s.VotesMutex.Unlock()
 
-	go s.broadcastVote(vote)
+	if !s.Faulty {
+		// Non-faulty servers broadcast the vote correctly
+		go s.broadcastVote(vote)
+	} else {
+		// Faulty server does not broadcast the vote
+		log.Printf("Server %d is faulty and did not broadcast the vote", s.ID)
+	}
 
 	w.WriteHeader(http.StatusOK)
 	fmt.Fprintf(w, "Vote received by server %d", s.ID)
